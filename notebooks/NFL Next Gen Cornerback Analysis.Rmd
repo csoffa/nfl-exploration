@@ -1,0 +1,351 @@
+---
+title: "NFL Next Gen Cornerback Analysis"
+output: html_notebook
+---
+* *Author: Cole Soffa*
+* *Source: https://www.kaggle.com/c/nfl-big-data-bowl-2021/*
+
+## Questions
+* Which CBs do the best job staying close to their receivers?
+* What's the EPA on throws at each corner?
+* Is there a correlation between separation from receiver and EPA?
+
+## Initial investigation of data
+Let's first read in some of our week 1 data.
+```{r}
+setwd("C:/Users/Cole/Documents/R/nfl/nfl-exploration/nfl-big-data-bowl/data")
+plays <- read_csv("plays.csv")
+week1 <- read_csv("week1.csv")
+```
+
+week1 contains all tracking data for each player on the field on a given play.
+```{r}
+head(week1)
+```
+
+What event types do we have?
+```{r}
+unique(week1$event)
+```
+
+How many plays do we have? We have: **`r nrow(all_plays) `** total plays
+```{r}
+all_plays <- week1 %>%
+  group_by(gameId,playId) %>%
+  summarise(gameId=max(gameId),playId=max(playId))
+```
+
+## Cleanning up our data
+Before we begin exploring our dataset, I want to filter out "non-coverage" plays. We see some events (e.g. field_goal_blocked) that look suspect.
+
+1. One of our events is "qb_spike". We have: **`r nrow(qb_spike_plays)`** plays
+```{r}
+qb_spike_plays <- filter(week1, event == "qb_spike") %>%
+  group_by(gameId,playId)%>%
+  summarise(gameId=max(gameId),playId=max(playId))
+```
+
+2. We also have "field_goal_blocked" events occurring during passing plays? We have: **`r nrow(fieldgoal_plays)`** plays. Let's join back to our main data set to see why these are included.
+```{r}
+fieldgoal_plays <- filter(week1, event == "field_goal_blocked") %>%
+  group_by(gameId,playId)%>%
+  summarise(gameId=max(gameId),playId=max(playId))
+test <- inner_join(week1,fieldgoal_plays,by=c('gameId','playId')) %>% filter(event != "None")
+test
+```
+This appears to be junk data, we have field_goal_blocked and pass_forward events happening in the same play. We'll filter these plays out as well.
+
+3. We also have "run" events. We have: **`r nrow(run_plays)`** plays
+```{r}
+run_plays <- filter(week1, event == 'run') %>%
+  group_by(gameId,playId) %>%
+  summarise(gameId=max(gameId),playId=max(playId))
+test = inner_join(week1,run_plays,by=c('gameId','playId')) %>% filter(event != 'None')
+test
+```
+
+It appears that each "run play" was either a play action run or qb run, some resulted in sacks. It's hard to tell whether these are designed runs or qb scrambles.Either way, a qb scrambling could skew our coverage data since CBs may drop out of coverage to pursue to the qb. I will drop these plays from our "valid" pass plays.
+
+4. We also have "handoff" events. We have: **`r nrow(handoff_plays)`** plays
+```{r}
+handoff_plays <- filter(week1, event == "handoff") %>%
+  group_by(gameId,playId)%>%
+  summarise(gameId=max(gameId),playId=max(playId))
+test <- inner_join(week1,handoff_plays,by=c('gameId','playId')) %>% filter(event!='None')
+test
+```
+Although these are handoffs that result in pass plays, these don't feel appropriate since they're not pure pass plays. Corner backs could be running to the ball changing up who they are actually covering. I am going to filter these out as well.
+
+There is a "touchdown" and "pass_outcome_touchdown", I want to see what difference is between these events
+```{r}
+touchdown_plays <- filter(week1, event == "touchdown") %>%
+  group_by(gameId,playId)%>%
+  summarise(gameId=max(gameId),playId=max(playId))
+test <- inner_join(week1,touchdown_plays,by=c('gameId','playId')) %>% filter(event!='None')
+test
+```
+It appears that these are touchdowns that occur after a catch.
+
+```{r}
+pass_touchdown_plays <- filter(week1, event == "pass_outcome_touchdown") %>%
+  group_by(gameId,playId)%>%
+  summarise(gameId=max(gameId),playId=max(playId))
+test <- inner_join(week1,pass_touchdown_plays,by=c('gameId','playId')) %>% filter(event!='None')
+test
+```
+
+Pass outcome touchdown simply represents a catch being made in the endzone.
+
+We also have "touchback" events, I want to make sure these are valid too.
+```{r}
+touchback_plays <- filter(week1, event == "touchback") %>%
+  group_by(gameId,playId)%>%
+  summarise(gameId=max(gameId),playId=max(playId))
+test <- inner_join(week1,touchback_plays,by=c('gameId','playId')) %>% filter(event!='None')
+test
+```
+We have **`r nrow(qb_spike_plays)+nrow(fieldgoal_plays)+nrow(handoff_plays)+nrow(run_plays)`** to filter out
+```{r}
+all_plays <- anti_join(all_plays,qb_spike_plays,by=c('gameId','playId'))
+all_plays <- anti_join(all_plays,fieldgoal_plays,by=c('gameId','playId'))
+all_plays <- anti_join(all_plays,handoff_plays,by=c('gameId','playId'))
+all_plays <- anti_join(all_plays,run_plays,by=c('gameId','playId'))
+```
+
+Let's see what type of plays we have in all_plays now. These events look valid for passing plays.
+```{r}
+unique(inner_join(week1,all_plays,by=c('gameId','playId'))$event)
+```
+
+
+## CB/WR dataframe creation
+Let's first create dataframes for corner backs and wide receivers. Let's see what all of our positions are in our data.
+
+```{r}
+unique(week1$position)
+```
+
+I am going to choose to only use CB, DB and WR (ignoring TE, SS, FS, etc.). We'll use these position types to create cbs and wrs data frames.
+```{r}
+cbs <- filter(week1, position %in% c('CB','DB'))
+wrs <- filter(week1, position == 'WR') %>% dplyr::select(gameId,playId,frameId,wrnflId=nflId,wrdisplayName=displayName,wrx=x,wry=y,wrs=s,wra=a,wrdis=dis,wro=o,wrdir=dir,wrroute=route)
+```
+
+We then will join the wrs df to the cbs one, we want every wide receiver at every frame attached to
+each cb at every frame.
+
+```{r}
+cb_wr_df <- inner_join(cbs, wrs, by=c('gameId','playId','frameId'))
+```
+
+Let's create a column "distance" which calculates how far each cb is from each wr at every frame. Let's also create a column "ydist" to measure how close a CB was to a WR at ball snap
+a ydist ~ 0 would signal the CB was lined up over the WR.
+
+```{r}
+cb_wr_df <- mutate(cb_wr_df, distance = ((x-wrx)^2+(y-wry)^2)^(1/2))
+cb_wr_df <- mutate(cb_wr_df, ydist = abs(y-wry))
+```
+
+Finally, let's join back to all_plays which should give us a full data set of valid passing plays/frames.
+```{r}
+cb_wr_df <- inner_join(cb_wr_df,all_plays,by=c('gameId','playId'))
+```
+
+## Determing when coverage starts/ends on a given play
+I want to add a column that signals which frame coverage is "done". The start of coverage should be as simple as the event of a ball snap.As a recap, we have **`r nrow(all_plays)`** total plays.
+
+* Plays where a ball is thrown would be when the pass arrives or pass is tipped?
+* Find all "pass_thrown" or "pass_shovel" events, these are plays where a ball was actually thrown  
+* We have: **`r nrow(pass_thrown) `** of these plays
+```{r}
+pass_thrown <- filter(cb_wr_df, event %in% c('pass_forward','pass_shovel')) %>%
+  group_by(gameId,playId) %>%
+  summarise(gameId = max(gameId),playId = max(playId))
+pass_thrown_frames <- inner_join(pass_thrown,cb_wr_df,by=c('gameId','playId'))
+```
+Not every play where a pass was thrown has a "pass_arrived" event but we have **`r nrow(pass_arrived)`** of these plays out of our **`r nrow(pass_thrown)`** plays.  I've also added a "coverage_done_frame" column to indicate the frame which coverage is "done"
+```{r}
+pass_arrived <- filter(pass_thrown_frames, event == 'pass_arrived') %>%
+  group_by(gameId,playId) %>%
+  summarise(gameId = max(gameId),playId = max(playId), coverage_done_frame = max(frameId))
+```
+Let's build a dataframe at the gameId,playId granularity. We'll use this to add additional columns and then we can join back to our main "frames" dataframe cb_wr_df.
+
+```{r}
+cb_wr_pass_plays <- pass_arrived
+head(cb_wr_pass_plays)
+```
+
+Let's look at the **`r nrow(pass_thrown)-nrow(pass_arrived)`** plays that don't have a "pass_arrived" event.
+```{r}
+non_pass_arrived <- anti_join(pass_thrown,pass_arrived,by=c('gameId','playId'))
+non_pass_arrived_frames <- inner_join(non_pass_arrived,cb_wr_df,by=c('gameId','playId'))
+unique(non_pass_arrived_frames$event)
+```
+Skimming these we have pass_incomplete, pass_tipped, interceptions, etc. Since pass_tipped plays will also have a pass_incomplete or interception, etc event, let's filter these out first. I would want to consider coverage done when the pass is tipped since cbs may drop coverage to find the ball. We have **`r nrow(pass_tipped) `** pass tipped plays, let's add these to our game/play pass df
+```{r}
+pass_tipped <- filter(non_pass_arrived_frames, event == 'pass_tipped') %>%
+  group_by(gameId,playId) %>%
+  summarise(gameId = max(gameId),playId = max(playId), coverage_done_frame = max(frameId))
+cb_wr_pass_plays <- rbind(cb_wr_pass_plays, pass_tipped)
+```
+Let's look at the ones that don't have a "pass_tipped", these should just be incompletions or interceptions. We have **`r nrow(non_pass_tipped)`** plays where a pass didn't arrive but was not tipped.
+```{r}
+non_pass_tipped <- anti_join(non_pass_arrived,pass_tipped,by=c('gameId','playId'))
+non_pass_tipped_frames <- inner_join(non_pass_tipped,cb_wr_df,by=c('gameId','playId'))
+unique(non_pass_tipped_frames$event)
+```
+**`r nrow(non_pass_tipped_incompletions)`** of these plays are incompletions.Let's add these to our data frame. We'll consider coverage done with the pass_outcome_incomplete event.
+```{r}
+non_pass_tipped_incompletions <- filter(non_pass_tipped_frames, event == 'pass_outcome_incomplete') %>%
+  group_by(gameId,playId) %>%
+  summarise(gameId = max(gameId),playId = max(playId),coverage_done_frame = max(frameId))
+non_pass_tipped_incompletions_frames <- inner_join(non_pass_tipped_incompletions,cb_wr_df,by=c('gameId','playId'))
+cb_wr_pass_plays <- rbind(cb_wr_pass_plays, non_pass_tipped_incompletions)
+```
+What are our last **`r nrow(non_pass_tipped)-nrow(non_pass_tipped_incompletions)`** plays where a pass didn't arrive and was not tipped?
+```{r}
+non_pass_tipped_other <- anti_join(non_pass_tipped,non_pass_tipped_incompletions, by=c('gameId','playId')) 
+non_pass_tipped_other_frames <- inner_join(non_pass_tipped_other,cb_wr_df,by=c('gameId','playId'))
+unique(non_pass_tipped_frames$event)
+```
+Let's look through each event left in here.  
+
+We have **`r nrow(non_pass_tipped_caught)`** plays where we have a "pass_outcome_caught" event. Appears we have some data points where there wasn't a pass_arrived event before a catch.
+```{r}
+non_pass_tipped_caught <- filter(non_pass_tipped_other_frames, event == 'pass_outcome_caught') %>%
+  group_by(gameId,playId) %>%
+  summarise(gameId = max(gameId),playId = max(playId),coverage_done_frame = max(frameId))
+```
+Lastly, we have **`r nrow(non_pass_tipped_interception)`** plays where we have a "pass_outcome_interception event.
+```{r}
+non_pass_tipped_interception <- filter(non_pass_tipped_other_frames, event == 'pass_outcome_interception') %>%
+  group_by(gameId,playId) %>%
+  summarise(gameId = max(gameId),playId = max(playId),coverage_done_frame = max(frameId))
+```
+
+Validated that we should have found all of the events resulting in coverage "done"! We have **`r nrow(validation)`** plays unaccounted for. Let's add the catch/interception plays to our df.
+```{r}
+validation <- anti_join(non_pass_tipped_other,non_pass_tipped_caught, by=c('gameId','playId'))
+validation <- anti_join(validation,non_pass_tipped_interception, by=c('gameId','playId'))
+cb_wr_pass_plays <- rbind(cb_wr_pass_plays, non_pass_tipped_caught)
+cb_wr_pass_plays <- rbind(cb_wr_pass_plays, non_pass_tipped_interception)
+```
+**IMPORTANT (1/6/21)** - we've filtered out plays where the ball wasn't actually thrown e.g. sacks  
+Need to come back to this later  
+* 2. plays where a ball is not thrown
+```{r}
+non_pass_thrown <- anti_join(all_plays,pass_thrown,by=c('gameId','playId'))
+non_pass_thrown <- inner_join(non_pass_thrown,cb_wr_df,by=c('gameId','playId'))
+unique(non_pass_thrown$event)
+non_pass_thrown <- filter(non_pass_thrown,event!='None')
+```
+**Finally**, we can join our cb_wr_pass_plays df to cb_wr_df to create a column "coverage_done_frame". We'll use this to filter out frames that occurred after coverage was "done"
+```{r}
+cb_wr_df <- inner_join(cb_wr_df,cb_wr_pass_plays, by=c('gameId','playId'))
+sum(is.na(cb_wr_df$coverage_done_frame))
+```
+## Determine which plays a cb was tracking a wr
+* Plays where a cb lined up "in front" of his wr at ball snap
+* Plays where a cb was "close" to a wr at the time of coverage being done
+* Plays where a cb "mirrored" a wr's route
+
+#### Plays where cb lined up in front of a wr at ball snap
+First let's use the y distance at ball snap to make sure cbs are lined up in line with a receiver. Pure distance may be misleading.
+```{r}
+closest_wr_ballsnap_df <- cb_wr_df %>% 
+  filter(event == 'ball_snap') %>%
+  group_by(gameId,playId,nflId) %>%
+  slice_min(ydist) %>%
+  dplyr::select(gameId,playId,nflId,ballsnapFrame=frameId,closestwrballsnapId=wrnflId,closestwrballsnapName=wrdisplayName, closestwrballsnapyDistance=ydist,closestwrballsnapDistance=distance)
+```
+Let's see what our distribution of y distances is at ball snap. Our average y distance from a receiver at ballsnap is: **`r round(mean(closest_wr_ballsnap_df$closestwrballsnapyDistance),2)`** yards
+```{r}
+ggplot(closest_wr_ballsnap_df, aes(x=closestwrballsnapyDistance))+
+  geom_histogram()
+```
+#### Plays where a cb was "close" to wr at time of coverage being "done"
+Using our coverage_done_frame, we should be able to see how far away cbs were from a wr at the time of coverage being done.
+```{r}
+closest_wr_coverage_done_df <- cb_wr_df %>% 
+  filter(frameId == coverage_done_frame) %>%
+  group_by(gameId,playId,nflId) %>%
+  slice_min(distance) %>%
+  dplyr::select(gameId,playId,nflId,closestwrcoveragedoneId=wrnflId,closestwrcoveragedoneName=wrdisplayName, closestwrcoveragedoneDistance=distance)
+```
+
+Let's again see what our distribution of distances when coverage is done. The average distance from cb to closest wr at coverage done is: **`r round(mean(closest_wr_coverage_done_df$closestwrcoveragedoneDistance),2)`** square yards.
+```{r}
+ggplot(closest_wr_coverage_done_df, aes(x=closestwrcoveragedoneDistance))+
+  geom_histogram()
+```
+We'll join these two data frames to our overall df so we can use these columns
+```{r}
+cb_wr_df <- inner_join(cb_wr_df, closest_wr_ballsnap_df, by=c('gameId','playId','nflId'))
+cb_wr_df <- inner_join(cb_wr_df, closest_wr_coverage_done_df, by=c('gameId','playId','nflId'))
+```
+
+#### Plays where cb and wr have similar "slopes" of their routes or "mirror" each other
+One idea is to use regression on cb/wr x and y data to see how closely they mirror each other. We could compare slope direction and magnitude to see which routes are similar? Let's first test this out with a single play.
+
+```{r}
+ggplotdata = filter(cb_wr_df, playId == 75, frameId <= coverage_done_frame, wrnflId == closestwrcoveragedoneId, wrnflId == closestwrballsnapId, closestwrballsnapyDistance < 3, closestwrcoveragedoneDistance < 10)
+```
+
+I'm going to fit linear models to both cb/wr x and y data. Let's also plot this visually too to make sure it looks right.
+```{r}
+lmcb=lm(data=ggplotdata, y~x)
+lmcb$coefficients[2]
+lmwr=lm(data=ggplotdata,wry~wrx)
+lmwr$coefficients[2]
+
+ggplot(data = ggplotdata, aes(x=x,y=y))+
+  geom_point()+
+  geom_line(aes(x=x,y=lmcb$fitted.values), color='green')+
+  geom_point(aes(wrx,wry))+
+  geom_line(aes(wrx,y=lmwr$fitted.values), color='red')
+```
+
+This looks like it should work, how do we apply this to every play for each cb? I'm going to create another data frame with the following granularity: gameId, playId, cbId, cblm, wrId, wrlm
+```{r}
+lmdf <- data.frame(gameId=as.numeric(),playId=as.numeric(),cbId=as.numeric(),cbInt=as.numeric(),cbSlope=as.numeric(),wrId=as.numeric(),wrInt=as.numeric(),wrSlope=as.numeric())
+for (game in unique(cb_wr_df$gameId)) {
+  plays = filter(cb_wr_df, gameId == game)
+  for (play in unique(plays$playId)) {
+    cbs = filter(plays, playId == play)
+    for (cb in unique(cbs$nflId)) {
+      cbdf = filter(cbs, nflId == cb)
+      for (wr in unique(cbdf$wrnflId)) {
+        wrdf = filter(cbdf, wrnflId == wr)
+        cblm = lm(data=wrdf,y~x)
+        wrlm = lm(data=wrdf,wry~wrx)
+        cbint = cblm$coefficients[1]
+        cbslope = cblm$coefficients[2]
+        wrint = wrlm$coefficients[1]
+        wrslope = wrlm$coefficients[2]
+        vector1 = c(game,play,cb,cbint,cbslope,wr,wrint,wrslope)
+        lmdf = rbind(lmdf,vector1)
+      }
+    }
+  }
+}
+colnames(lmdf) <- c('gameId','playId','cbId','cbInt','cbSlope','wrId','wrInt','wrSlope')
+head(lmdf)
+```
+Quick validation that my logic worked correctly.
+```{r}
+length(unique(cb_wr_df$gameId))
+length(unique(lmdf$gameId))
+length(unique(cb_wr_df$playId))
+length(unique(lmdf$playId))
+```
+
+Finally, we need to join to our main data frame which will give us regressions for every cb/wr combo.
+```{r}
+cb_wr_df <- inner_join(cb_wr_df, lmdf, by=c('gameId','playId','nflId'='cbId','wrnflId'='wrId'))
+```
+
+## Filtering to find coverage frames
+
+
+
