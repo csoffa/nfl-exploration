@@ -11,9 +11,20 @@ output: html_notebook
 * Is there a correlation between separation from receiver and EPA?
 
 ## Initial investigation of data
+
+First load in necessary libraries.
+```{r message=FALSE}
+library(ggplot2)
+library(readr)
+library(tidyverse)
+library(dplyr)
+library(MASS)
+library(FNN)
+```
+
 Let's first read in some of our week 1 data.
-```{r}
-setwd("C:/Users/Cole/Documents/R/nfl/nfl-exploration/nfl-big-data-bowl/data")
+```{r message=FALSE}
+setwd("C:/Users/Cole/Documents/R/nfl-exploration/data")
 plays <- read_csv("plays.csv")
 week1 <- read_csv("week1.csv")
 ```
@@ -346,6 +357,128 @@ cb_wr_df <- inner_join(cb_wr_df, lmdf, by=c('gameId','playId','nflId'='cbId','wr
 ```
 
 ## Filtering to find coverage frames
+We now have a data frame that contains every column we need to identify plays where corner backs were in coverage. Let's now use these columns to filter our data frame to only frames of x,y data we want.
+
+#### Plays where the cb "lined up" close to the wr at ballsnap
+Let's go back to our distribution of y distances at ball snap.
+```{r}
+ggplot(closest_wr_ballsnap_df, aes(x=closestwrballsnapyDistance))+
+  geom_histogram()
+```
+Let's visualize one play where a CB is 2.5 yards away from wr at ball_snap in the y direction.
+```{r}
+test_data <- filter(cb_wr_df,playId==992, nflId == 2539334 , wrnflId == 2507763)
+ggplot(test_data, aes(x=x,y=y))+
+  geom_point(aes(color=displayName))+
+  geom_point(aes(x=wrx,y=wry, color = wrdisplayName))+
+  xlim(0,120)+
+  ylim(0,55)
+```
+Let's start conservatively and say we only want plays where < 2.5. Let's also filter out plays where total distance at ball snap is too large (25 yards^2). Cbs can play off the ball coverage but we don't want too large of distances at ball snap.
+```{r}
+cb_wr_df <- filter(cb_wr_df, closestwrballsnapyDistance <= 2.5, closestwrballsnapDistance < 25)
+max(cb_wr_df$closestwrballsnapyDistance)
+```
+#### Plays where cb is in the vicinity of reciever when coverage is over
+We can't assume that a cb being "lined up" over a receiver means they're covering them. Corner backs could be dropping into zone. We want to look for receivers "in the vicinity" of their receiver when coverage is done.Let's go back to our distribution of distances when coverage is done.
+```{r}
+ggplot(closest_wr_coverage_done_df, aes(x=closestwrcoveragedoneDistance))+
+  geom_histogram()
+```
+
+Let's visualize one play where a CB is "20 units" away from wr at end of coverage.
+```{r}
+test_data <- filter(cb_wr_df, playId==1869, nflId == 2555378, wrnflId == 2543471)
+ggplot(test_data, aes(x=x,y=y))+
+  geom_point(aes(color=displayName))+
+  geom_point(aes(x=wrx,y=wry, color = wrdisplayName))+
+  xlim(0,120)+
+  ylim(0,55)
+```
+Let's be conservative again, we don't want to filter out "bad" plays where a cb got beat. Also our last filter on slope of cb/wr routes should filter out more plays.
+```{r}
+cb_wr_df <- filter(cb_wr_df, closestwrcoveragedoneDistance <= 20)
+max(cb_wr_df$closestwrcoveragedoneDistance)
+```
+
+#### Route slopes for both the cb and wr to be in the same direction/magnitude.
+First, I will add additional columns on our linear model data frame to specify if direction or magnitude match between the cb and wr. We'll use a difference of 0.5 slope units based on the visual below.
+```{r}
+lmdf$slopedirectionMatch <- ifelse(lmdf$cbSlope > 0 & lmdf$wrSlope > 0,1,ifelse(lmdf$cbSlope < 0 & lmdf$wrSlope < 0,1,0))
+lmdf$slopemagnitudeMatch <- ifelse(abs(lmdf$cbSlope-lmdf$wrSlope) < 0.5,1,0)
+```
+
+Below shows a slope magnitude difference of ~0.7, this doesn't look like the routes match each other enough. This is why I chose to use 0.5 difference in slope.
+```{r}
+test_data <- filter(cb_wr_df, playId==168, nflId == 2552689, wrnflId == 2533040)
+ggplot(test_data, aes(x=x,y=y))+
+  geom_point(aes(color=displayName))+
+  geom_point(aes(x=wrx,y=wry, color = wrdisplayName))+
+  xlim(0,120)+
+  ylim(0,55)
+```
+
+So we will filter out any cb/wrs that don't have a magnitude or direction match.
+```{r}
+cb_wr_df <- filter(cb_wr_df, slopemagnitudeMatch != 1 | slopedirectionMatch != 1)
+```
 
 
+#### Additional filters
+We also want to apply a couple of last filters:  
+* frameId < coverage_done_frame (only want x/y data during "coverage")  
+* wrnflId == closestwrcoveragedoneId, wrnflId == closestwrballsnapId (only want to track x/y data for these receivers)
+```{r}
+cb_wr_df <- filter(cb_wr_df, frameId < coverage_done_frame, wrnflId == closestwrcoveragedoneId, wrnflId == closestwrballsnapId)
+```
 
+## Preliminary analysis
+We finally have a "clean" data frame to play with. Let's take a peek at the corner backs we're looking at.
+```{r}
+unique(cb_wr_df$displayName)
+```
+
+Let's start playing around and visualizing a few well known cbs.
+```{r}
+ggplot(data = filter(cb_wr_df, displayName %in% c('Marcus Peters','Patrick Peterson','Kevin King','Jaire Alexander','Aqib Talib')), aes(x = frameId, y = distance))+
+  geom_smooth(aes(color = displayName))
+  #geom_point(aes(color=displayName))
+```
+This is pretty interesting. Distance from the WRs looks like it goes up initially, drops significantly and than increases again as more frames go by. Jaire Alexander seems to mirror his receivers the cloest in our small group too.
+
+Let's fit a regression model to our data to quantify distance from receivers over the course of a play. First I'll plot our data to see if there is anything interesting.
+```{r}
+ggplot(cb_wr_df)+
+    geom_point(aes(x=frameId,y=distance),color = 'gray', size = 0.1)
+  
+```
+At first glance there doesn't seem to be much. I'll try fitting a line to this data using geom_smooth() to see what our pattern looks like.
+
+```{r}
+ggplot(cb_wr_df)+
+    geom_point(aes(x=frameId,y=distance),color = 'gray', size = 0.1)+
+    geom_smooth(aes(x=frameId,y=distance))
+```
+Looking at the smoothed line, a polynomial fit looks like it could work. Let's compare to a quadratic fit to see the difference.
+```{r}
+mq <- lm(data=cb_wr_df,distance~poly(frameId,2,raw=TRUE))
+mp <- lm(data=cb_wr_df,distance~poly(frameId,,raw=TRUE))
+summary(mq)
+summary(mp)
+```
+Obviously the fit containing higher order terms is going to fit the data the closest. The polynomial fit explains about 3% more of the variation in our data compared to the quadratic fit. I'll visualize the fit below as well. 
+```{r}
+ggplot(data=cb_wr_df)+
+  geom_point(aes(x=frameId,y=distance),color = 'gray', size = 0.1)+
+  geom_line(aes(x=frameId,y=mq$fitted.values), color = 'blue')+
+  geom_line(aes(x=frameId,y=mp$fitted.values), color = 'green')+
+  geom_smooth(data=filter(cb_wr_df,displayName %in% c('Patrick Peterson','Jaire Alexander')),aes(x=frameId,y=distance, color=displayName))
+```
+
+It's curious too that towards the end of some of these longer plays, separation drops significantly again. Could this be due to longer throws where a corner back is actually catching back up to their receiver?
+
+General thoughts:  
+Which cbs have the least amount of separation?  
+Is separation earlier in a play more predictive of pass outcomes?  
+
+**To be continued...** 
